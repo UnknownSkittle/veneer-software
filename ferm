@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Developer-side installer for the VeneerOS HTTPS package index."""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path, PurePosixPath
+
+
+INDEX_URL = (
+    "https://raw.githubusercontent.com/UnknownSkittle/veneer-software/"
+    "main/repo/index.json"
+)
+NAME_RE = re.compile(r"^[a-z0-9._+-]+$")
+VERSION_RE = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
+)
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+INSTALL_ROOTS = {"programs", "data", "drivers", "skins"}
+DATABASE_PATH = PurePosixPath("sys/settings/ferm/installed.json")
+
+
+class FermError(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise FermError(message)
+
+
+def validate_name(name):
+    require(isinstance(name, str) and NAME_RE.fullmatch(name), "invalid package name")
+
+
+def version_parts(version):
+    match = VERSION_RE.fullmatch(version) if isinstance(version, str) else None
+    require(match is not None, f"invalid semantic version: {version!r}")
+    major, minor, patch, prerelease = match.groups()
+    pre_parts = []
+    if prerelease:
+        for part in prerelease.split("."):
+            require(part != "", f"invalid semantic version: {version!r}")
+            if part.isdigit():
+                require(part == "0" or not part.startswith("0"),
+                        f"invalid semantic version: {version!r}")
+                pre_parts.append((0, int(part)))
+            else:
+                pre_parts.append((1, part))
+    return (int(major), int(minor), int(patch)), prerelease is None, pre_parts
+
+
+def is_newer(candidate, installed):
+    candidate_core, candidate_release, candidate_pre = version_parts(candidate)
+    installed_core, installed_release, installed_pre = version_parts(installed)
+    if candidate_core != installed_core:
+        return candidate_core > installed_core
+    if candidate_release != installed_release:
+        return candidate_release
+    if candidate_release:
+        return False
+    for candidate_part, installed_part in zip(candidate_pre, installed_pre):
+        if candidate_part != installed_part:
+            return candidate_part > installed_part
+    return len(candidate_pre) > len(installed_pre)
+
+
+def fetch_json(url):
+    require(urllib.parse.urlparse(url).scheme == "https", "only HTTPS URLs are allowed")
+    request = urllib.request.Request(url, headers={"User-Agent": "ferm/1"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            require(urllib.parse.urlparse(response.geturl()).scheme == "https",
+                    "HTTPS requests may not redirect to HTTP")
+            document = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FermError(f"could not fetch or parse {url}: {exc}") from exc
+    require(isinstance(document, dict), f"expected a JSON object at {url}")
+    return document
+
+
+def fetch_asset(url, expected_sha256):
+    require(urllib.parse.urlparse(url).scheme == "https", "only HTTPS URLs are allowed")
+    request = urllib.request.Request(url, headers={"User-Agent": "ferm/1"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            require(urllib.parse.urlparse(response.geturl()).scheme == "https",
+                    "HTTPS requests may not redirect to HTTP")
+            payload = response.read()
+    except (OSError, urllib.error.URLError) as exc:
+        raise FermError(f"could not fetch {url}: {exc}") from exc
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    require(actual_sha256 == expected_sha256, f"SHA-256 mismatch for {url}")
+    return payload
+
+
+def validate_index(index):
+    require(index.get("schema") == 1, "unsupported index schema")
+    packages = index.get("packages")
+    require(isinstance(packages, dict), "index packages must be an object")
+    for name, entry in packages.items():
+        validate_name(name)
+        require(isinstance(entry, dict), f"invalid catalog entry for {name}")
+        version_parts(entry.get("version"))
+        require(isinstance(entry.get("description"), str),
+                f"invalid description for {name}")
+        require(isinstance(entry.get("repository"), str)
+                and urllib.parse.urlparse(entry["repository"]).scheme == "https",
+                f"invalid repository URL for {name}")
+        manifest = entry.get("manifest")
+        require(isinstance(manifest, str)
+                and urllib.parse.urlparse(manifest).scheme == "https",
+                f"invalid manifest URL for {name}")
+        expected_suffix = f"/repo/packages/{name}/{entry['version']}.json"
+        require(urllib.parse.urlparse(manifest).path.endswith(expected_suffix),
+                f"manifest URL does not match {name} {entry['version']}")
+    return packages
+
+
+def validate_manifest(manifest, name, version, repository):
+    require(manifest.get("schema") == 1, "unsupported manifest schema")
+    require(manifest.get("name") == name, "manifest package name does not match index")
+    require(manifest.get("version") == version,
+            "manifest version does not match index")
+    require(manifest.get("repository") == repository,
+            "manifest repository does not match index")
+    files = manifest.get("files")
+    require(isinstance(files, list), "manifest files must be an array")
+    paths = set()
+    for item in files:
+        require(isinstance(item, dict), "invalid manifest file entry")
+        path = item.get("path")
+        parts = validate_install_path(path)
+        normalized = "/" + "/".join(parts)
+        require(normalized not in paths,
+                f"duplicate or non-normalized install path: {path}")
+        paths.add(normalized)
+        require(isinstance(item.get("url"), str)
+                and urllib.parse.urlparse(item["url"]).scheme == "https",
+                f"invalid HTTPS asset URL for {path}")
+        require(isinstance(item.get("sha256"), str)
+                and SHA256_RE.fullmatch(item["sha256"]),
+                f"invalid SHA-256 digest for {path}")
+    return files
+
+
+def validate_install_path(path):
+    require(isinstance(path, str) and path.startswith("/"),
+            "install path must be absolute")
+    parts = PurePosixPath(path).parts[1:]
+    require(len(parts) >= 2 and parts[0] in INSTALL_ROOTS,
+            f"install path is outside allowed roots: {path}")
+    require(all(part not in (".", "..") for part in parts)
+            and "\\" not in path and "\x00" not in path
+            and "/" + "/".join(parts) == path,
+            f"invalid install path: {path}")
+    return parts
+
+
+def load_database(root):
+    database_file = safe_database_target(root)
+    if not database_file.exists():
+        return {"schema": 1, "packages": {}}
+    try:
+        database = json.loads(database_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise FermError(f"could not read installed package database: {exc}") from exc
+    require(isinstance(database, dict) and database.get("schema") == 1
+            and isinstance(database.get("packages"), dict),
+            "installed package database is invalid")
+    return database
+
+
+def safe_target(root, path):
+    parts = validate_install_path(path)
+    return safe_root_target(root, parts, path)
+
+
+def safe_database_target(root):
+    return safe_root_target(root, DATABASE_PATH.parts, "/" + DATABASE_PATH.as_posix())
+
+
+def safe_root_target(root, parts, display_path):
+    target = root.joinpath(*parts)
+    current = root
+    for part in parts:
+        current = current / part
+        require(not current.is_symlink(), f"refusing symlink path: {display_path}")
+    resolved_parent = target.parent.resolve()
+    require(resolved_parent == root or root in resolved_parent.parents,
+            f"path escapes selected root: {display_path}")
+    return target
+
+
+def atomic_write(destination, payload):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(dir=destination.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as temporary_file:
+            temporary_file.write(payload)
+        os.replace(temporary_name, destination)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+def save_database(root, database):
+    database_file = safe_database_target(root)
+    encoded = (json.dumps(database, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    atomic_write(database_file, encoded)
+
+
+def remove_recorded_files(root, record, keep_paths=()):
+    keep_paths = set(keep_paths)
+    for item in record.get("files", []):
+        path = item.get("path")
+        if path in keep_paths:
+            continue
+        try:
+            target = safe_target(root, path)
+            if not target.exists():
+                continue
+            if not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != item.get("sha256"):
+                print(f"left modified or non-file path in place: {path}", file=sys.stderr)
+                continue
+            target.unlink()
+        except (OSError, FermError) as exc:
+            print(f"left {path} in place: {exc}", file=sys.stderr)
+
+
+def install_package(root, name, entry, database):
+    manifest = fetch_json(entry["manifest"])
+    manifest_files = validate_manifest(
+        manifest, name, entry["version"], entry["repository"]
+    )
+    downloaded = []
+    for item in manifest_files:
+        downloaded.append((item["path"], item["sha256"],
+                           fetch_asset(item["url"], item["sha256"])))
+
+    old_record = database["packages"].get(name)
+    new_paths = {path for path, _, _ in downloaded}
+    for path, _, payload in downloaded:
+        target = safe_target(root, path)
+        atomic_write(target, payload)
+    if old_record:
+        remove_recorded_files(root, old_record, keep_paths=new_paths)
+
+    database["packages"][name] = {
+        "version": entry["version"],
+        "files": [{"path": path, "sha256": digest}
+                  for path, digest, _ in downloaded],
+    }
+    save_database(root, database)
+    print(f"installed {name} {entry['version']}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="VeneerOS package repository utility")
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("-I", metavar="PACKAGE", help="install catalog version")
+    action.add_argument("-U", metavar="PACKAGE", help="update installed package")
+    action.add_argument("-R", metavar="PACKAGE", help="remove installed package")
+    action.add_argument("-AU", dest="upgrade_all", action="store_true",
+                        help="upgrade installed packages with newer catalog versions")
+    parser.add_argument("--root", type=Path, default=Path("/"),
+                        help="filesystem root (default: /)")
+    parser.add_argument("--index-url", default=INDEX_URL,
+                        help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    try:
+        root = args.root.resolve()
+        if args.R:
+            validate_name(args.R)
+            database = load_database(root)
+            record = database["packages"].pop(args.R, None)
+            require(record is not None, f"{args.R} is not installed")
+            remove_recorded_files(root, record)
+            save_database(root, database)
+            print(f"removed {args.R}")
+            return 0
+
+        index = fetch_json(args.index_url)
+        packages = validate_index(index)
+        database = load_database(root)
+        if args.upgrade_all:
+            candidates = sorted(database["packages"])
+        else:
+            name = args.I or args.U
+            validate_name(name)
+            candidates = [name]
+
+        for name in candidates:
+            require(name in packages, f"{name} is not present in the catalog")
+            installed = database["packages"].get(name)
+            if args.I:
+                require(installed is None,
+                        f"{name} is already installed; use -U to update it")
+            elif args.U or args.upgrade_all:
+                require(installed is not None, f"{name} is not installed")
+                if not is_newer(packages[name]["version"], installed["version"]):
+                    print(f"{name} is already current")
+                    continue
+            install_package(root, name, packages[name], database)
+        return 0
+    except FermError as exc:
+        print(f"ferm: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
