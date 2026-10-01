@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Developer-side installer for the VeneerOS HTTPS package index."""
-
 import argparse
 import hashlib
 import json
